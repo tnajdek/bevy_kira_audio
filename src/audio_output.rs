@@ -484,6 +484,10 @@ pub(crate) fn update_instance_states<T: Resource>(
 #[cfg(test)]
 mod test {
     use std::marker::PhantomData;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use super::*;
     use crate::channel::AudioControl;
@@ -491,7 +495,8 @@ mod test {
     use bevy::asset::AssetPlugin;
     use bevy::prelude::*;
     use kira::AudioManagerSettings;
-    use kira::backend::mock::MockBackend;
+    use kira::backend::mock::{MockBackend, MockBackendSettings};
+    use kira::effect::{Effect, EffectBuilder};
     use uuid::Uuid;
 
     #[test]
@@ -508,6 +513,8 @@ mod test {
             .remove_resource::<Assets<AudioInstance>>()
             .unwrap();
 
+        // Kept inline for reviewability. The helpers below could make this
+        // setup shorter, but avoiding that refactor keeps this patch additive.
         let mut audio_output = AudioOutput {
             manager: AudioManager::new(AudioManagerSettings::<MockBackend>::default()).ok(),
             instances: HashMap::default(),
@@ -556,6 +563,8 @@ mod test {
             .remove_resource::<Assets<AudioInstance>>()
             .unwrap();
 
+        // Kept inline for reviewability. The helpers below could make this
+        // setup shorter, but avoiding that refactor keeps this patch additive.
         let mut audio_output = AudioOutput {
             manager: AudioManager::new(AudioManagerSettings::<MockBackend>::default()).ok(),
             instances: HashMap::default(),
@@ -583,5 +592,157 @@ mod test {
             _ => panic!("Wrong audio command"),
         }
         assert!(channel.commands.write().pop_back().is_none());
+    }
+
+    #[test]
+    fn channel_track_registration_creates_kira_sub_track() {
+        let mut audio_output = effect_test_audio_output();
+        let channel = Channel::Typed(TypeId::of::<Audio>());
+
+        let mut track_builder = TrackBuilder::new();
+        track_builder.add_effect(CountingEffectBuilder::default());
+
+        audio_output.create_channel_track(channel.clone(), track_builder);
+
+        assert!(audio_output.channel_tracks.contains_key(&channel));
+        assert_eq!(
+            audio_output.manager.as_ref().unwrap().num_sub_tracks(),
+            1,
+            "registered channel tracks should be backed by Kira sub-tracks"
+        );
+    }
+
+    #[test]
+    fn channel_track_effect_processes_channel_audio() {
+        let mut audio_output = effect_test_audio_output();
+        let channel_id = Channel::Typed(TypeId::of::<Audio>());
+
+        let mut track_builder = TrackBuilder::new();
+        let processed_frames = track_builder.add_effect(CountingEffectBuilder::default());
+        audio_output.create_channel_track(channel_id.clone(), track_builder);
+
+        let mut audio_sources = Assets::<AudioSource>::default();
+        let mut audio_instances = Assets::<AudioInstance>::default();
+        let sound = audio_sources.add(AudioSource {
+            sound: non_silent_test_sound(),
+        });
+
+        let channel = AudioChannel::<Audio>::default();
+        channel.play(sound);
+        audio_output.play_channel(&audio_sources, &channel, &mut audio_instances);
+
+        // Advance Kira's mock backend so the channel track's effect chain runs.
+        process_mock_audio(&mut audio_output, 4);
+
+        assert!(channel.commands.write().is_empty());
+        assert_eq!(audio_output.instances.get(&channel_id).unwrap().len(), 1);
+        assert!(
+            processed_frames.load(Ordering::Relaxed) > 0,
+            "channel effect was not processed for channel audio"
+        );
+    }
+
+    #[test]
+    fn play_command_with_pending_instance_effect_is_retried_intact() {
+        let audio_sources = Assets::<AudioSource>::default();
+        let mut audio_instances = Assets::<AudioInstance>::default();
+        let mut audio_output = effect_test_audio_output();
+        let unloaded_sound: Handle<AudioSource> =
+            Handle::<AudioSource>::Uuid(Uuid::new_v4(), PhantomData);
+
+        let channel = AudioChannel::<Audio>::default();
+        channel
+            .play(unloaded_sound.clone())
+            .with_effect(CountingEffectBuilder::default());
+
+        audio_output.play_channel(&audio_sources, &channel, &mut audio_instances);
+
+        let retried_command = channel.commands.write().pop_back().unwrap();
+        match retried_command {
+            AudioCommand::Play(settings) => {
+                assert_eq!(settings.source.id(), unloaded_sound.id());
+                assert!(
+                    settings
+                        .settings
+                        .track_builder
+                        .expect("missing per-instance track builder")
+                        .lock()
+                        .is_some(),
+                    "per-instance effect track was consumed before the source loaded"
+                );
+            }
+            _ => panic!("Wrong audio command"),
+        }
+    }
+
+    // Test-only effect used as a routing probe. Its handle records how many
+    // non-silent frames reached the track effect chain.
+    #[derive(Default)]
+    struct CountingEffectBuilder {
+        processed_frames: Arc<AtomicUsize>,
+    }
+
+    struct CountingEffect {
+        processed_frames: Arc<AtomicUsize>,
+    }
+
+    impl EffectBuilder for CountingEffectBuilder {
+        type Handle = Arc<AtomicUsize>;
+
+        fn build(self) -> (Box<dyn Effect>, Self::Handle) {
+            let handle = self.processed_frames.clone();
+            (
+                Box::new(CountingEffect {
+                    processed_frames: self.processed_frames,
+                }),
+                handle,
+            )
+        }
+    }
+
+    impl Effect for CountingEffect {
+        fn process(&mut self, input: &mut [kira::Frame], _dt: f64, _info: &kira::info::Info) {
+            let non_silent_frames = input
+                .iter()
+                .filter(|frame| **frame != kira::Frame::ZERO)
+                .count();
+            self.processed_frames
+                .fetch_add(non_silent_frames, Ordering::Relaxed);
+        }
+    }
+
+    fn effect_test_audio_output() -> AudioOutput<MockBackend> {
+        let settings = AudioManagerSettings::<MockBackend> {
+            backend_settings: MockBackendSettings {
+                sample_rate: TEST_SAMPLE_RATE,
+            },
+            ..Default::default()
+        };
+        AudioOutput {
+            manager: AudioManager::new(settings).ok(),
+            instances: HashMap::default(),
+            channels: HashMap::default(),
+            channel_tracks: HashMap::default(),
+            instance_tracks: HashMap::default(),
+        }
+    }
+
+    fn process_mock_audio(audio_output: &mut AudioOutput<MockBackend>, chunks: usize) {
+        let manager = audio_output.manager.as_mut().unwrap();
+        for _ in 0..chunks {
+            manager.backend_mut().on_start_processing();
+            manager.backend_mut().process();
+        }
+    }
+
+    const TEST_SAMPLE_RATE: u32 = 44_100;
+
+    fn non_silent_test_sound() -> kira::sound::static_sound::StaticSoundData {
+        kira::sound::static_sound::StaticSoundData {
+            sample_rate: TEST_SAMPLE_RATE,
+            frames: vec![kira::Frame::from_mono(0.25); 1024].into(),
+            settings: kira::sound::static_sound::StaticSoundSettings::default(),
+            slice: None,
+        }
     }
 }
