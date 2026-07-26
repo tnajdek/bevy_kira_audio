@@ -87,6 +87,8 @@ Effects modify the audio signal of a single sound or of a whole channel. Adding 
 
 Add them to a single sound instance ([`filter` example](examples/filter.rs)), or to an `AudioTrack` that applies them to every sound on a channel ([`reverb_channel` example](examples/reverb_channel.rs)). Multiple effects can be chained ([`multiple_effects` example](examples/multiple_effects.rs)).
 
+Effects on a single sound keep running for a short while after that sound stops, so reverb and delay tails are not cut off. Use `with_effect_tail` to give a long reverb more time, or to reclaim the track sooner ([`effect_tail` example](examples/effect_tail.rs)).
+
 The built-in effects are filter, reverb, delay, distortion, compressor, EQ filter, volume control and panning control. You can also write your own by implementing `Effect` and `AudioEffect` ([`peak_meter` example](examples/peak_meter.rs)).
 
 ### Spatial audio

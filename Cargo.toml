@@ -115,6 +115,11 @@ path = "examples/multiple_effects_channel.rs"
 required-features = ["ogg"]
 
 [[example]]
+name = "effect_tail"
+path = "examples/effect_tail.rs"
+required-features = ["ogg"]
+
+[[example]]
 name = "peak_meter"
 path = "examples/peak_meter.rs"
 required-features = ["ogg"]

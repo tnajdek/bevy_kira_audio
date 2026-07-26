@@ -8,7 +8,7 @@ use crate::backend_settings::AudioSettings;
 use crate::channel::dynamic::DynamicAudioChannels;
 use crate::channel::typed::AudioChannel;
 use crate::channel::{Channel, ChannelState};
-use crate::effect::AudioTrack;
+use crate::effect::{AudioTrack, DEFAULT_EFFECT_TAIL};
 use crate::instance::AudioInstance;
 use crate::source::AudioSource;
 use bevy::asset::{AssetId, Assets, Handle};
@@ -17,11 +17,53 @@ use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{NonSend, Res};
 use bevy::ecs::world::{FromWorld, World};
 use bevy::log::warn;
+use bevy::platform::time::Instant;
 use kira::backend::{Backend, DefaultBackend};
 use kira::track::TrackHandle;
 use kira::{AudioManager, Panning};
 use kira::{Decibels, PlaybackRate};
 use std::collections::HashMap;
+use std::time::Duration;
+
+/// The sub-track carrying one sound instance's effects.
+///
+/// Kira tears a track out of the audio graph as soon as its handle is dropped, without waiting for
+/// anything still ringing on it to fade. Dropping the handle the moment playback stops would
+/// therefore silence reverb and delay tails instead of letting them ring out, so the handle is held
+/// for a while longer.
+struct InstanceTrack {
+    /// Held only for its `Drop`, which is what removes the sub-track from the audio graph.
+    #[expect(dead_code, reason = "kept alive so that dropping it removes the track")]
+    handle: TrackHandle,
+    /// How long to hold on after the sound stops.
+    tail: Duration,
+    /// When the tail runs out. `None` while the sound is still playing.
+    ///
+    /// Effects ring out in wall-clock time, so this deadline is taken against
+    /// [`Instant`] rather than any of Bevy's clocks, which can be paused, scaled or missing
+    /// entirely when [`TimePlugin`](bevy::time::TimePlugin) is not part of the app.
+    expires_at: Option<Instant>,
+}
+
+impl InstanceTrack {
+    fn new(handle: TrackHandle, tail: Duration) -> Self {
+        Self {
+            handle,
+            tail,
+            expires_at: None,
+        }
+    }
+
+    /// Start the countdown after which the track and its effects are torn down.
+    fn start_tail(&mut self, now: Instant) {
+        self.expires_at.get_or_insert(now + self.tail);
+    }
+
+    /// Report whether the track should be kept at `now`.
+    fn keep_alive(&self, now: Instant) -> bool {
+        self.expires_at.is_none_or(|expires_at| now < expires_at)
+    }
+}
 
 /// Non-send resource that acts as audio output
 ///
@@ -32,7 +74,7 @@ pub(crate) struct AudioOutput<B: Backend = DefaultBackend> {
     instances: HashMap<Channel, Vec<Handle<AudioInstance>>>,
     channels: HashMap<Channel, ChannelState>,
     channel_tracks: HashMap<Channel, TrackHandle>,
-    instance_tracks: HashMap<AssetId<AudioInstance>, TrackHandle>,
+    instance_tracks: HashMap<AssetId<AudioInstance>, InstanceTrack>,
 }
 
 impl FromWorld for AudioOutput {
@@ -238,8 +280,11 @@ impl<B: Backend> AudioOutput<B> {
                 Ok(mut track_handle) => {
                     let result = track_handle.play(sound);
                     if result.is_ok() {
+                        let tail = partial_sound_settings
+                            .effect_tail
+                            .unwrap_or(DEFAULT_EFFECT_TAIL);
                         self.instance_tracks
-                            .insert(instance_handle.id(), track_handle);
+                            .insert(instance_handle.id(), InstanceTrack::new(track_handle, tail));
                     }
                     result
                 }
@@ -420,22 +465,27 @@ impl<B: Backend> AudioOutput<B> {
     }
 
     pub(crate) fn cleanup_stopped_instances(&mut self, instances: &mut Assets<AudioInstance>) {
+        let now = Instant::now();
+
         for handles in self.instances.values_mut() {
             handles.retain(|handle| {
-                if let Some(instance) = instances.get(handle) {
-                    if instance.handle.state() == kira::sound::PlaybackState::Stopped {
-                        // Drop the per-instance track handle (kira will clean up the sub-track)
-                        self.instance_tracks.remove(&handle.id());
-                        false
-                    } else {
-                        true
+                let stopped = instances.get(handle).is_none_or(|instance| {
+                    instance.handle.state() == kira::sound::PlaybackState::Stopped
+                });
+                if stopped {
+                    // Let the effects on this instance's track ring out before tearing it down.
+                    if let Some(track) = self.instance_tracks.get_mut(&handle.id()) {
+                        track.start_tail(now);
                     }
-                } else {
-                    self.instance_tracks.remove(&handle.id());
-                    false
                 }
+
+                !stopped
             });
         }
+
+        // Dropping the handle is what removes the sub-track from kira's audio graph.
+        self.instance_tracks
+            .retain(|_, track| track.keep_alive(now));
     }
 }
 
@@ -499,7 +549,43 @@ mod test {
     use bevy::prelude::*;
     use kira::AudioManagerSettings;
     use kira::backend::mock::MockBackend;
+    use kira::track::TrackBuilder;
     use uuid::Uuid;
+
+    fn instance_track(tail: Duration) -> InstanceTrack {
+        let mut manager =
+            AudioManager::new(AudioManagerSettings::<MockBackend>::default()).unwrap();
+
+        InstanceTrack::new(manager.add_sub_track(TrackBuilder::new()).unwrap(), tail)
+    }
+
+    #[test]
+    fn instance_track_is_kept_while_its_sound_plays() {
+        let track = instance_track(Duration::from_millis(100));
+        let now = Instant::now();
+
+        assert!(track.keep_alive(now + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn instance_track_outlives_its_sound_by_the_effect_tail() {
+        let mut track = instance_track(Duration::from_millis(100));
+        let now = Instant::now();
+        track.start_tail(now);
+
+        assert!(track.keep_alive(now + Duration::from_millis(60)));
+        assert!(track.keep_alive(now + Duration::from_millis(99)));
+        assert!(!track.keep_alive(now + Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn a_zero_effect_tail_drops_the_instance_track_right_away() {
+        let mut track = instance_track(Duration::ZERO);
+        let now = Instant::now();
+        track.start_tail(now);
+
+        assert!(!track.keep_alive(now));
+    }
 
     #[test]
     fn keeps_order_of_commands_to_retry() {

@@ -22,6 +22,11 @@
 //! }
 //! ```
 //!
+//! Effects added to a single sound run on a track of that sound's own. Reverb and delay keep
+//! sounding after their input has gone quiet, so that track outlives the sound by
+//! [`DEFAULT_EFFECT_TAIL`]; see
+//! [`with_effect_tail`](crate::PlayAudioCommand::with_effect_tail) to change how long.
+//!
 //! # Custom effects
 //!
 //! Implement [`Effect`] to process audio frames yourself, then implement [`AudioEffect`] for a
@@ -68,6 +73,15 @@ pub use kira::effect::filter::{FilterBuilder, FilterMode};
 pub use kira::effect::panning_control::PanningControlBuilder;
 pub use kira::effect::reverb::ReverbBuilder;
 pub use kira::effect::volume_control::VolumeControlBuilder;
+
+/// How long a sound's effects keep running after the sound itself has stopped.
+///
+/// Effects like reverb and delay go on producing sound after their input has gone quiet. A sound
+/// with per-instance effects plays on its own track, and tearing that track down the moment the
+/// sound ends would cut those tails off mid-ring. The track is therefore kept for this long
+/// afterwards. Override it per sound with
+/// [`with_effect_tail`](crate::PlayAudioCommand::with_effect_tail).
+pub const DEFAULT_EFFECT_TAIL: Duration = Duration::from_secs(2);
 
 /// Something that can be added to an audio track as an effect.
 ///

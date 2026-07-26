@@ -56,6 +56,7 @@ pub(crate) struct PartialSoundSettings {
     pub(crate) fade_in: Option<AudioTween>,
     pub(crate) emitter: Option<Entity>,
     pub(crate) track: Option<SharedAudioTrack>,
+    pub(crate) effect_tail: Option<Duration>,
 }
 
 impl fmt::Debug for PartialSoundSettings {
@@ -72,6 +73,7 @@ impl fmt::Debug for PartialSoundSettings {
             .field("fade_in", &self.fade_in)
             .field("emitter", &self.emitter)
             .field("track", &self.track.as_ref().map(|_| "..."))
+            .field("effect_tail", &self.effect_tail)
             .finish()
     }
 }
@@ -324,7 +326,8 @@ impl<'a> PlayAudioCommand<'a> {
     /// **Note:** Per-instance effects and channel-level effects (via
     /// [`add_audio_channel_with_track`](AudioApp::add_audio_channel_with_track)) are independent.
     /// When a sound has per-instance effects, it plays on its own sub-track and bypasses the
-    /// channel's effect chain.
+    /// channel's effect chain. That sub-track outlives the sound, so effects that ring out are
+    /// not cut short; see [`with_effect_tail`](Self::with_effect_tail).
     ///
     /// ```no_run
     /// # use bevy::prelude::*;
@@ -366,6 +369,29 @@ impl<'a> PlayAudioCommand<'a> {
     /// ```
     pub fn with_effect<E: AudioEffect>(&mut self, effect: E) -> &mut Self {
         self.add_effect(effect);
+        self
+    }
+
+    /// Set how long this sound's effects keep running after the sound itself has stopped.
+    ///
+    /// Reverb and delay go on producing sound after their input has gone quiet. The track carrying
+    /// this sound's effects is kept alive for this long after playback stops, so those tails are
+    /// not cut off. Defaults to [`DEFAULT_EFFECT_TAIL`](crate::effect::DEFAULT_EFFECT_TAIL).
+    ///
+    /// ```no_run
+    /// # use bevy::prelude::*;
+    /// # use bevy_kira_audio::prelude::*;
+    /// # use std::time::Duration;
+    ///
+    /// fn play(audio: Res<Audio>, asset_server: Res<AssetServer>) {
+    ///     audio.play(asset_server.load("sounds/loop.ogg"))
+    ///         .with_effect(ReverbBuilder::new().feedback(0.95))
+    ///         .with_effect_tail(Duration::from_secs(6));
+    /// }
+    /// ```
+    pub fn with_effect_tail(&mut self, tail: Duration) -> &mut Self {
+        self.settings.effect_tail = Some(tail);
+
         self
     }
 }
