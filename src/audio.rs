@@ -1,9 +1,11 @@
 //! Common audio types
 
 use crate::AudioSystemSet;
-use crate::audio_output::{play_audio_channel, update_instance_states};
+use crate::audio_output::{AudioOutput, play_audio_channel, update_instance_states};
 use crate::channel::AudioCommandQue;
+use crate::channel::Channel;
 use crate::channel::typed::AudioChannel;
+use crate::effect::{AudioEffect, AudioTrack};
 use crate::instance::AudioInstance;
 use crate::source::AudioSource;
 use bevy::app::{App, PreUpdate};
@@ -11,13 +13,24 @@ use bevy::asset::Handle;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs;
+use bevy::log::error;
 use bevy::prelude::{PostUpdate, default};
 use kira::sound::EndPosition;
 use kira::sound::static_sound::{StaticSoundData, StaticSoundHandle};
 use kira::{Decibels, Panning, Value};
+use parking_lot::Mutex;
+use std::any::TypeId;
+use std::fmt;
 use std::marker::PhantomData;
+use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
+
+/// A thread-safe, shareable wrapper around an [`AudioTrack`].
+///
+/// Used to pass an `AudioTrack` (which is `Send` but not `Sync`) through
+/// Bevy's command queue by wrapping it in `Arc<Mutex<Option<AudioTrack>>>`.
+pub(crate) type SharedAudioTrack = Arc<Mutex<Option<AudioTrack>>>;
 
 #[derive(Debug)]
 pub(crate) enum AudioCommand {
@@ -30,7 +43,7 @@ pub(crate) enum AudioCommand {
     Resume(Option<AudioTween>),
 }
 
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Default)]
 pub(crate) struct PartialSoundSettings {
     pub(crate) loop_start: Option<f64>,
     pub(crate) loop_end: Option<f64>,
@@ -42,6 +55,25 @@ pub(crate) struct PartialSoundSettings {
     pub(crate) paused: bool,
     pub(crate) fade_in: Option<AudioTween>,
     pub(crate) emitter: Option<Entity>,
+    pub(crate) track: Option<SharedAudioTrack>,
+}
+
+impl fmt::Debug for PartialSoundSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PartialSoundSettings")
+            .field("loop_start", &self.loop_start)
+            .field("loop_end", &self.loop_end)
+            .field("volume", &self.volume)
+            .field("playback_rate", &self.playback_rate)
+            .field("start_position", &self.start_position)
+            .field("panning", &self.panning)
+            .field("reverse", &self.reverse)
+            .field("paused", &self.paused)
+            .field("fade_in", &self.fade_in)
+            .field("emitter", &self.emitter)
+            .field("track", &self.track.as_ref().map(|_| "..."))
+            .finish()
+    }
 }
 
 /// Different kinds of easing for fade-in and fade-out
@@ -50,7 +82,7 @@ pub type AudioEasing = kira::Easing;
 /// A tween for audio transitions
 ///
 /// Use the default for almost instantaneous transitions without audio artifacts
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct AudioTween {
     duration: Duration,
     easing: AudioEasing,
@@ -283,6 +315,59 @@ impl<'a> PlayAudioCommand<'a> {
         self.settings.emitter = Some(emitter_entity);
         self
     }
+
+    /// Add an audio effect to this sound instance and return its handle for runtime control.
+    ///
+    /// The effect will be applied via a dedicated sub-track created for this sound instance.
+    /// The returned handle can be stored and used to modify the effect at runtime.
+    ///
+    /// **Note:** Per-instance effects and channel-level effects (via
+    /// [`add_audio_channel_with_track`](AudioApp::add_audio_channel_with_track)) are independent.
+    /// When a sound has per-instance effects, it plays on its own sub-track and bypasses the
+    /// channel's effect chain.
+    ///
+    /// ```no_run
+    /// # use bevy::prelude::*;
+    /// # use bevy_kira_audio::prelude::*;
+    ///
+    /// fn play(audio: Res<Audio>, asset_server: Res<AssetServer>) {
+    ///     let mut cmd = audio.play(asset_server.load("sounds/loop.ogg"));
+    ///     let filter_handle = cmd.add_effect(FilterBuilder::new());
+    ///     cmd.looped();
+    /// }
+    /// ```
+    pub fn add_effect<E: AudioEffect>(&mut self, effect: E) -> E::Handle {
+        let shared = self
+            .settings
+            .track
+            .get_or_insert_with(|| Arc::new(Mutex::new(None)));
+        let mut guard = shared.lock();
+
+        guard
+            .get_or_insert_with(AudioTrack::for_instance)
+            .add_effect(effect)
+    }
+
+    /// Add an audio effect to this sound instance (chainable).
+    ///
+    /// Like [`add_effect`](Self::add_effect), but discards the effect handle
+    /// and returns `&mut Self` for method chaining.
+    ///
+    /// ```no_run
+    /// # use bevy::prelude::*;
+    /// # use bevy_kira_audio::prelude::*;
+    ///
+    /// fn play(audio: Res<Audio>, asset_server: Res<AssetServer>) {
+    ///     audio.play(asset_server.load("sounds/loop.ogg"))
+    ///         .with_effect(FilterBuilder::new())
+    ///         .with_effect(ReverbBuilder::new())
+    ///         .looped();
+    /// }
+    /// ```
+    pub fn with_effect<E: AudioEffect>(&mut self, effect: E) -> &mut Self {
+        self.add_effect(effect);
+        self
+    }
 }
 
 pub(crate) enum TweenCommandKind {
@@ -461,6 +546,7 @@ impl From<&StaticSoundHandle> for PlaybackState {
 /// Extension trait to add new audio channels to the application
 pub trait AudioApp {
     /// Add a new audio channel to the application
+    /// Adding a channel that is already registered does nothing.
     ///
     /// ```no_run
     /// use bevy::prelude::*;
@@ -483,10 +569,45 @@ pub trait AudioApp {
     /// struct Background;
     /// ```
     fn add_audio_channel<T: Resource>(&mut self) -> &mut Self;
+
+    /// Add a new audio channel with a custom [`AudioTrack`] for channel-level effects.
+    ///
+    /// Effects added to the `AudioTrack` will apply to all sounds played on this channel.
+    /// You can use [`AudioTrack::add_effect`] to add effects and store the returned handles
+    /// as Bevy resources for runtime control.
+    ///
+    /// [`AudioPlugin`](crate::AudioPlugin) must be added before calling this method. If it has not
+    /// been added yet, an error is logged and the channel is added without the track or its effects.
+    ///
+    /// ```no_run
+    /// use bevy::prelude::*;
+    /// use bevy_kira_audio::prelude::*;
+    ///
+    /// #[derive(Resource)]
+    /// struct MusicChannel;
+    ///
+    /// fn main() {
+    ///     let mut track = AudioTrack::new();
+    ///     let _reverb = track.add_effect(ReverbBuilder::new());
+    ///
+    ///     App::new()
+    ///         .add_plugins(DefaultPlugins)
+    ///         .add_plugins(AudioPlugin)
+    ///         .add_audio_channel_with_track::<MusicChannel>(track)
+    ///         .run();
+    /// }
+    /// ```
+    fn add_audio_channel_with_track<T: Resource>(&mut self, track: AudioTrack) -> &mut Self;
 }
 
 impl AudioApp for App {
     fn add_audio_channel<T: Resource>(&mut self) -> &mut Self {
+        // Registering a channel twice would run its systems twice per frame and drop anything
+        // already queued on the channel.
+        if self.world().contains_resource::<AudioChannel<T>>() {
+            return self;
+        }
+
         self.add_systems(
             PostUpdate,
             play_audio_channel::<T>.in_set(AudioSystemSet::PlayTypedChannels),
@@ -496,5 +617,21 @@ impl AudioApp for App {
             update_instance_states::<T>.after(AudioSystemSet::InstanceCleanup),
         )
         .insert_resource(AudioChannel::<T>::default())
+    }
+
+    fn add_audio_channel_with_track<T: Resource>(&mut self, track: AudioTrack) -> &mut Self {
+        self.add_audio_channel::<T>();
+
+        if let Some(mut audio_output) = self.world_mut().get_non_send_mut::<AudioOutput>() {
+            audio_output.create_channel_track(Channel::Typed(TypeId::of::<T>()), track);
+        } else {
+            error!(
+                "Failed to add audio track for channel `{}`: `AudioPlugin` must be added before \
+                 `add_audio_channel_with_track`; the channel was added without the track",
+                std::any::type_name::<T>(),
+            );
+        }
+
+        self
     }
 }
