@@ -18,6 +18,7 @@ use bevy::ecs::system::{NonSend, Res};
 use bevy::ecs::world::{FromWorld, World};
 use bevy::log::warn;
 use bevy::platform::time::Instant;
+use kira::ResourceLimitReached;
 use kira::backend::{Backend, DefaultBackend};
 use kira::track::TrackHandle;
 use kira::{AudioManager, Panning};
@@ -275,8 +276,7 @@ impl<B: Backend> AudioOutput<B> {
 
         let sound_handle = if let Some(track) = instance_track {
             // Per-instance effects: create a sub-track for this instance
-            let manager = self.manager.as_mut().unwrap();
-            match manager.add_sub_track(track.into_inner()) {
+            match self.add_instance_track(channel, track) {
                 Ok(mut track_handle) => {
                     let result = track_handle.play(sound);
                     if result.is_ok() {
@@ -444,6 +444,27 @@ impl<B: Backend> AudioOutput<B> {
         }
     }
 
+    /// Create the sub-track carrying one sound's own effects.
+    ///
+    /// The track is nested under the channel's track when the channel has one, so that the
+    /// channel's effects still run after this sound's. Kira processes a track's children before
+    /// the track's own effects, which makes the resulting chain sound → instance effects →
+    /// channel effects → main track. Channels without a track of their own attach it directly to
+    /// the main track instead.
+    fn add_instance_track(
+        &mut self,
+        channel: &Channel,
+        track: AudioTrack,
+    ) -> Result<TrackHandle, ResourceLimitReached> {
+        let track = track.into_inner();
+
+        if let Some(channel_track) = self.channel_tracks.get_mut(channel) {
+            channel_track.add_sub_track(track)
+        } else {
+            self.manager.as_mut().unwrap().add_sub_track(track)
+        }
+    }
+
     pub(crate) fn create_channel_track(&mut self, channel: Channel, track: AudioTrack) {
         if let Some(manager) = self.manager.as_mut() {
             match manager.add_sub_track(track.into_inner()) {
@@ -544,12 +565,17 @@ mod test {
 
     use super::*;
     use crate::channel::AudioControl;
-    use crate::{Audio, AudioPlugin};
+    use crate::effect::{AudioEffect, Effect, FilterBuilder, Info, ReverbBuilder};
+    use crate::{Audio, AudioPlugin, PlayAudioCommand};
     use bevy::asset::AssetPlugin;
     use bevy::prelude::*;
     use kira::AudioManagerSettings;
-    use kira::backend::mock::MockBackend;
+    use kira::Frame;
+    use kira::backend::mock::{MockBackend, MockBackendSettings};
+    use kira::sound::static_sound::{StaticSoundData, StaticSoundSettings};
     use kira::track::TrackBuilder;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use uuid::Uuid;
 
     fn instance_track(tail: Duration) -> InstanceTrack {
@@ -557,6 +583,117 @@ mod test {
             AudioManager::new(AudioManagerSettings::<MockBackend>::default()).unwrap();
 
         InstanceTrack::new(manager.add_sub_track(TrackBuilder::new()).unwrap(), tail)
+    }
+
+    const SAMPLE_RATE: u32 = 44_100;
+
+    fn audio_output() -> AudioOutput<MockBackend> {
+        let settings = AudioManagerSettings::<MockBackend> {
+            // The mock backend renders at 1 Hz by default, which is too coarse to play a sound.
+            backend_settings: MockBackendSettings {
+                sample_rate: SAMPLE_RATE,
+            },
+            ..default()
+        };
+
+        AudioOutput {
+            manager: AudioManager::new(settings).ok(),
+            instances: HashMap::default(),
+            channels: HashMap::default(),
+            channel_tracks: HashMap::default(),
+            instance_tracks: HashMap::default(),
+        }
+    }
+
+    /// A second of audio at full amplitude, so that effects can tell it from silence.
+    fn audio_source() -> AudioSource {
+        AudioSource {
+            sound: StaticSoundData {
+                sample_rate: SAMPLE_RATE,
+                frames: Arc::from(vec![Frame::from_mono(1.0); SAMPLE_RATE as usize]),
+                settings: StaticSoundSettings::default(),
+                slice: None,
+            },
+        }
+    }
+
+    /// Render a single buffer, which is what pushes queued sounds and tracks to the renderer and
+    /// runs every effect in the graph over their audio.
+    fn render(audio_output: &mut AudioOutput<MockBackend>) {
+        let backend = audio_output
+            .manager
+            .as_mut()
+            .expect("the mock manager was created")
+            .backend_mut();
+
+        backend.on_start_processing();
+        backend.process();
+    }
+
+    /// An effect recording whether any audio reached it.
+    struct Probe(Arc<AtomicBool>);
+
+    impl Probe {
+        fn new() -> Self {
+            Self(Arc::new(AtomicBool::new(false)))
+        }
+    }
+
+    impl Effect for Probe {
+        fn process(&mut self, input: &mut [Frame], _dt: f64, _info: &Info) {
+            if input.iter().any(|frame| *frame != Frame::ZERO) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    impl AudioEffect for Probe {
+        type Handle = Arc<AtomicBool>;
+
+        fn build_effect(self) -> (Box<dyn Effect>, Self::Handle) {
+            let heard = self.0.clone();
+
+            (Box::new(self), heard)
+        }
+    }
+
+    /// The channel that `AudioChannel<Audio>` plays on.
+    fn main_channel() -> Channel {
+        Channel::Typed(TypeId::of::<Audio>())
+    }
+
+    /// Number of sub-tracks of the given channel's own track.
+    fn channel_sub_tracks(audio_output: &AudioOutput<MockBackend>, channel: &Channel) -> usize {
+        audio_output
+            .channel_tracks
+            .get(channel)
+            .expect("the channel has a track")
+            .num_sub_tracks()
+    }
+
+    /// Number of tracks attached directly to the manager.
+    fn manager_sub_tracks(audio_output: &AudioOutput<MockBackend>) -> usize {
+        audio_output
+            .manager
+            .as_ref()
+            .expect("the mock manager was created")
+            .num_sub_tracks()
+    }
+
+    /// Play a single sound on `AudioChannel<Audio>`, configured by `configure`.
+    fn play_on_main_channel(
+        audio_output: &mut AudioOutput<MockBackend>,
+        configure: impl FnOnce(&mut PlayAudioCommand),
+    ) {
+        let mut sources = Assets::<AudioSource>::default();
+        let mut instances = Assets::<AudioInstance>::default();
+        let source: Handle<AudioSource> = Handle::Uuid(Uuid::new_v4(), PhantomData);
+        let _ = sources.insert(&source, audio_source());
+
+        let channel = AudioChannel::<Audio>::default();
+        configure(&mut channel.play(source));
+
+        audio_output.play_channel(&sources, &channel, &mut instances);
     }
 
     #[test]
@@ -588,6 +725,78 @@ mod test {
     }
 
     #[test]
+    fn instance_effects_run_on_a_sub_track_of_the_channel_track() {
+        let mut audio_output = audio_output();
+        audio_output.create_channel_track(
+            main_channel(),
+            AudioTrack::new().with_effect(ReverbBuilder::new()),
+        );
+
+        play_on_main_channel(&mut audio_output, |command| {
+            command.with_effect(FilterBuilder::new());
+        });
+
+        assert_eq!(audio_output.instances[&main_channel()].len(), 1);
+        assert_eq!(audio_output.instance_tracks.len(), 1);
+        assert_eq!(channel_sub_tracks(&audio_output, &main_channel()), 1);
+        // The channel's own track is the only one hanging off the manager.
+        assert_eq!(manager_sub_tracks(&audio_output), 1);
+    }
+
+    #[test]
+    fn a_sound_with_its_own_effects_is_processed_by_the_channel_effects_as_well() {
+        let mut audio_output = audio_output();
+        let mut track = AudioTrack::new();
+        let channel_probe = track.add_effect(Probe::new());
+        audio_output.create_channel_track(main_channel(), track);
+
+        let mut instance_probe = None;
+        play_on_main_channel(&mut audio_output, |command| {
+            instance_probe = Some(command.add_effect(Probe::new()));
+        });
+        render(&mut audio_output);
+
+        assert!(
+            instance_probe.unwrap().load(Ordering::Relaxed),
+            "the sound did not reach its own effects"
+        );
+        assert!(
+            channel_probe.load(Ordering::Relaxed),
+            "the sound bypassed the channel's effects"
+        );
+    }
+
+    #[test]
+    fn instance_effects_run_on_a_manager_track_without_a_channel_track() {
+        let mut audio_output = audio_output();
+
+        play_on_main_channel(&mut audio_output, |command| {
+            command.with_effect(FilterBuilder::new());
+        });
+
+        assert_eq!(audio_output.instances[&main_channel()].len(), 1);
+        assert_eq!(audio_output.instance_tracks.len(), 1);
+        assert!(audio_output.channel_tracks.is_empty());
+        assert_eq!(manager_sub_tracks(&audio_output), 1);
+    }
+
+    #[test]
+    fn a_sound_without_effects_plays_on_the_channel_track_itself() {
+        let mut audio_output = audio_output();
+        audio_output.create_channel_track(
+            main_channel(),
+            AudioTrack::new().with_effect(ReverbBuilder::new()),
+        );
+
+        play_on_main_channel(&mut audio_output, |_| {});
+
+        assert_eq!(audio_output.instances[&main_channel()].len(), 1);
+        assert!(audio_output.instance_tracks.is_empty());
+        assert_eq!(channel_sub_tracks(&audio_output, &main_channel()), 0);
+        assert_eq!(manager_sub_tracks(&audio_output), 1);
+    }
+
+    #[test]
     fn keeps_order_of_commands_to_retry() {
         // we only need this app to conveniently get a assets collection for `AudioSource`...
         let mut app = App::new();
@@ -601,13 +810,7 @@ mod test {
             .remove_resource::<Assets<AudioInstance>>()
             .unwrap();
 
-        let mut audio_output = AudioOutput {
-            manager: AudioManager::new(AudioManagerSettings::<MockBackend>::default()).ok(),
-            instances: HashMap::default(),
-            channels: HashMap::default(),
-            channel_tracks: HashMap::default(),
-            instance_tracks: HashMap::default(),
-        };
+        let mut audio_output = audio_output();
         let audio_handle_one: Handle<AudioSource> =
             Handle::<AudioSource>::Uuid(Uuid::new_v4(), PhantomData);
         let audio_handle_two: Handle<AudioSource> =
@@ -649,13 +852,7 @@ mod test {
             .remove_resource::<Assets<AudioInstance>>()
             .unwrap();
 
-        let mut audio_output = AudioOutput {
-            manager: AudioManager::new(AudioManagerSettings::<MockBackend>::default()).ok(),
-            instances: HashMap::default(),
-            channels: HashMap::default(),
-            channel_tracks: HashMap::default(),
-            instance_tracks: HashMap::default(),
-        };
+        let mut audio_output = audio_output();
         let audio_handle_one: Handle<AudioSource> =
             Handle::<AudioSource>::Uuid(Uuid::new_v4(), PhantomData);
         let audio_handle_two: Handle<AudioSource> =

@@ -21,6 +21,7 @@ These examples are simple Bevy Apps illustrating the capabilities of `bevy_kira_
 | [`settings.rs`](/examples/settings.rs)                   | Demonstrate settings supported when playing a sound                  |
 | [`settings_loader.rs`](/examples/settings_loader.rs)     | Loading a sound with applied settings                                |
 | [`spatial.rs`](/examples/spatial.rs)                     | Demonstration of the limited support for spatial audio               |
+| [`stacked_effects.rs`](/examples/stacked_effects.rs)     | A per-sound effect and a channel effect applied to the same sound    |
 | [`status.rs`](/examples/status.rs)                       | Continuously get the playback state of a sound                       |
 | [`stress_test.rs`](/examples/stress_test.rs)             | Example app playing a high number of sounds every frame              |
 

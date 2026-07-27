@@ -169,6 +169,11 @@ impl AudioTrack {
     }
 
     /// Set the maximum number of sub-tracks this track can hold.
+    ///
+    /// Every sound played on this channel with per-instance effects (see
+    /// [`add_effect`](crate::PlayAudioCommand::add_effect)) runs on a sub-track of this one and
+    /// takes a slot for as long as it plays, plus its
+    /// [effect tail](crate::PlayAudioCommand::with_effect_tail).
     #[must_use = "This method consumes self and returns a modified AudioTrack, so the return value should be used"]
     pub fn sub_track_capacity(self, capacity: usize) -> Self {
         Self(self.0.sub_track_capacity(capacity))

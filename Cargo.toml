@@ -115,6 +115,11 @@ path = "examples/multiple_effects_channel.rs"
 required-features = ["ogg"]
 
 [[example]]
+name = "stacked_effects"
+path = "examples/stacked_effects.rs"
+required-features = ["ogg"]
+
+[[example]]
 name = "effect_tail"
 path = "examples/effect_tail.rs"
 required-features = ["ogg"]

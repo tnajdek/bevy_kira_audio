@@ -324,9 +324,13 @@ impl<'a> PlayAudioCommand<'a> {
     /// The returned handle can be stored and used to modify the effect at runtime.
     ///
     /// **Note:** Per-instance effects and channel-level effects (via
-    /// [`add_audio_channel_with_track`](AudioApp::add_audio_channel_with_track)) are independent.
-    /// When a sound has per-instance effects, it plays on its own sub-track and bypasses the
-    /// channel's effect chain. That sub-track outlives the sound, so effects that ring out are
+    /// [`add_audio_channel_with_track`](AudioApp::add_audio_channel_with_track)) stack. When the
+    /// channel has a track of its own, this sound's sub-track is nested inside it, so the sound is
+    /// processed by its own effects first and by the channel's effects afterwards. Each such
+    /// sub-track takes one of the channel track's
+    /// [`sub_track_capacity`](AudioTrack::sub_track_capacity) slots, or one of
+    /// [`AudioSettings::sub_track_capacity`](crate::AudioSettings::sub_track_capacity) for
+    /// channels without a track. The sub-track outlives the sound, so effects that ring out are
     /// not cut short; see [`with_effect_tail`](Self::with_effect_tail).
     ///
     /// ```no_run
