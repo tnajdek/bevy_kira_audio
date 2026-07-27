@@ -22,15 +22,14 @@ use parking_lot::Mutex;
 use std::any::TypeId;
 use std::fmt;
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::mem;
 use std::time::Duration;
 use uuid::Uuid;
 
-/// A thread-safe, shareable wrapper around an [`AudioTrack`].
-///
-/// Used to pass an `AudioTrack` (which is `Send` but not `Sync`) through
-/// Bevy's command queue by wrapping it in `Arc<Mutex<Option<AudioTrack>>>`.
-pub(crate) type SharedAudioTrack = Arc<Mutex<Option<AudioTrack>>>;
+/// The slot carrying one sound instance's own [`AudioTrack`] to the audio output.
+/// Wrapped because the audio output must take the `Send`-but-not-`Sync` track out through
+/// a shared reference to the command queue.
+pub(crate) type InstanceTrackSlot = Mutex<Option<Box<AudioTrack>>>;
 
 #[derive(Debug)]
 pub(crate) enum AudioCommand {
@@ -43,7 +42,7 @@ pub(crate) enum AudioCommand {
     Resume(Option<AudioTween>),
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub(crate) struct PartialSoundSettings {
     pub(crate) loop_start: Option<f64>,
     pub(crate) loop_end: Option<f64>,
@@ -55,7 +54,7 @@ pub(crate) struct PartialSoundSettings {
     pub(crate) paused: bool,
     pub(crate) fade_in: Option<AudioTween>,
     pub(crate) emitter: Option<Entity>,
-    pub(crate) track: Option<SharedAudioTrack>,
+    pub(crate) track: InstanceTrackSlot,
     pub(crate) effect_tail: Option<Duration>,
 }
 
@@ -72,7 +71,13 @@ impl fmt::Debug for PartialSoundSettings {
             .field("paused", &self.paused)
             .field("fade_in", &self.fade_in)
             .field("emitter", &self.emitter)
-            .field("track", &self.track.as_ref().map(|_| "..."))
+            .field(
+                "track",
+                &self
+                    .track
+                    .try_lock()
+                    .map_or(Some("<locked>"), |track| track.as_ref().map(|_| "...")),
+            )
             .field("effect_tail", &self.effect_tail)
             .finish()
     }
@@ -182,7 +187,7 @@ impl PartialSoundSettings {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct PlayAudioSettings {
     pub(crate) instance_handle: Handle<AudioInstance>,
     pub(crate) source: Handle<AudioSource>,
@@ -190,11 +195,12 @@ pub struct PlayAudioSettings {
 }
 
 impl<'a> From<&mut PlayAudioCommand<'a>> for PlayAudioSettings {
+    /// Takes the settings out of the command, which is only ever done as the command is dropped.
     fn from(command: &mut PlayAudioCommand<'a>) -> Self {
         PlayAudioSettings {
             instance_handle: command.instance_handle.clone(),
             source: command.source.clone(),
-            settings: command.settings.clone(),
+            settings: mem::take(&mut command.settings),
         }
     }
 }
@@ -344,14 +350,10 @@ impl<'a> PlayAudioCommand<'a> {
     /// }
     /// ```
     pub fn add_effect<E: AudioEffect>(&mut self, effect: E) -> E::Handle {
-        let shared = self
-            .settings
+        self.settings
             .track
-            .get_or_insert_with(|| Arc::new(Mutex::new(None)));
-        let mut guard = shared.lock();
-
-        guard
-            .get_or_insert_with(AudioTrack::for_instance)
+            .get_mut()
+            .get_or_insert_with(|| Box::new(AudioTrack::for_instance()))
             .add_effect(effect)
     }
 

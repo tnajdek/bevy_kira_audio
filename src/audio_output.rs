@@ -269,14 +269,11 @@ impl<B: Backend> AudioOutput<B> {
         partial_sound_settings.apply(&mut sound);
 
         // Determine where to play the sound based on per-instance and channel tracks
-        let instance_track = partial_sound_settings
-            .track
-            .as_ref()
-            .and_then(|shared| shared.lock().take());
+        let instance_track = partial_sound_settings.track.lock().take();
 
         let sound_handle = if let Some(track) = instance_track {
             // Per-instance effects: create a sub-track for this instance
-            match self.add_instance_track(channel, track) {
+            match self.add_instance_track(channel, *track) {
                 Ok(mut track_handle) => {
                     let result = track_handle.play(sound);
                     if result.is_ok() {
